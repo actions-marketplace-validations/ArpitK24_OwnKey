@@ -1,7 +1,7 @@
 {
   "name": "ownkey",
-  "version": "1.4.1",
-  "description": "Local-first AI code reviewer CLI: review git changes, gate PRs with SARIF, and apply verified fixes using your own OpenAI, Anthropic, Gemini, or Ollama keys",
+  "version": "1.6.2",
+  "description": "Self-hosted AI pull request reviewer that double-checks every finding: summaries, inline one-click fixes, incremental reviews and @ownkey chat in your own GitHub Actions, on your own OpenAI, Anthropic, Gemini or Ollama key",
   "main": "dist/index.js",
   "bin": {
     "ownkey": "dist/index.js"
@@ -34,21 +34,20 @@
   },
   "homepage": "https://github.com/ArpitK24/ownkey#readme",
   "keywords": [
-    "ai",
-    "coding-agent",
-    "cli",
-    "code-analysis",
-    "refactoring",
-    "bug-detection",
-    "llm",
-    "developer-tools",
     "code-review",
     "ai-code-review",
-    "sarif",
+    "pull-request",
+    "pr-review",
     "github-action",
-    "pre-commit",
+    "github-actions",
+    "self-hosted",
     "byok",
-    "ollama"
+    "ollama",
+    "sarif",
+    "pre-commit",
+    "llm",
+    "cli",
+    "developer-tools"
   ],
   "author": "OwnKey Team",
   "license": "MIT",
@@ -66,7 +65,8 @@
     "keytar": "^7.9.0",
     "ora": "^8.1.1",
     "postgres": "^3.4.5",
-    "react": "^18.3.1"
+    "react": "^18.3.1",
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
     "@types/diff": "^6.0.0",

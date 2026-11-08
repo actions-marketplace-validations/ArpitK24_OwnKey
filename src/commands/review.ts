@@ -3,7 +3,9 @@ import { basename, resolve } from 'path';
 import { writeFile } from 'fs/promises';
 import { createRequire } from 'module';
 import chalk from 'chalk';
-import { KeeperStatus, keeperPose } from '../ui/keeper-term.js';
+import { KeeperStatus, keeperPose, paintKeeper } from '../ui/keeper-term.js';
+import { renderFindings, severityCounts } from '../core/review/text.js';
+import { readForReview } from '../core/review/git.js';
 import { keeperShown, reportKeeperMood } from '../ui/keeper.js';
 import { logger } from '../utils/logger.js';
 import { AIProviderFactory } from '../ai/factory.js';
@@ -12,6 +14,7 @@ import { meetsSeverity, parseSeverity } from '../utils/severity.js';
 import { persistSuggestions } from '../core/persist.js';
 import { describeScope, gitRoot, resolveScope } from '../core/review/git.js';
 import { analyzeChanges, prepareReview } from '../core/review/run.js';
+import { loadRepoConfig } from '../config/repo-config.js';
 import { Finding, anchorLine, sortFindings, toMarkdown, toSarif } from '../core/review/report.js';
 
 const FORMATS = ['text', 'markdown', 'json', 'sarif'] as const;
@@ -29,8 +32,9 @@ export const reviewCommand = new Command('review')
     .option('--sarif-output <file>', 'Also write a SARIF report to this file (GitHub code scanning)')
     .option('--markdown-output <file>', 'Also write a Markdown report to this file (PR comment, job summary)')
     .option('--fail-on <level>', 'Exit with code 1 if any finding is at or above this severity (for CI)')
-    .option('--max-files <number>', 'Maximum changed files to review', '25')
+    .option('--max-files <number>', 'Maximum changed files to review (default 25, or reviews.max_files in .ownkey.yml)')
     .option('--quick', 'Single-pass review without repository tools (faster, cheaper, less context)')
+    .option('--no-double-check', 'Skip the second pass that checks each finding against the code')
     .option('--max-steps <number>', 'Tool rounds the reviewer may use to investigate the repository', '6')
     .action(async (path: string, options) => {
         try {
@@ -38,7 +42,6 @@ export const reviewCommand = new Command('review')
             if (!FORMATS.includes(format)) {
                 throw new Error(`Unknown format "${options.format}". Use one of: ${FORMATS.join(', ')}`);
             }
-            const minSeverity = parseSeverity(options.severity);
             const failOn = parseSeverity(options.failOn);
             const typeFilter: string | undefined = options.type?.toLowerCase();
             const machine = format !== 'text' && !options.output;
@@ -54,10 +57,12 @@ export const reviewCommand = new Command('review')
             }
 
             const root = gitRoot(resolve(path));
+            const repoConfig = loadRepoConfig(root);
+            const minSeverity = parseSeverity(options.severity) ?? repoConfig.reviews.severity;
             const scope = resolveScope(root, { staged: options.staged, base: options.base });
             const scopeLabel = describeScope(scope);
-            const maxFiles = parseInt(options.maxFiles, 10) || 25;
-            const target = await prepareReview(root, scope, maxFiles);
+            const maxFiles = parseInt(options.maxFiles ?? '', 10) || repoConfig.reviews.maxFiles || 25;
+            const target = await prepareReview(root, scope, maxFiles, repoConfig.reviews.pathFilters);
             const { changes, reviewable: files, selected } = target;
 
             if (files.length === 0) {
@@ -67,12 +72,15 @@ export const reviewCommand = new Command('review')
                 return;
             }
 
-            say(chalk.bold(`\nReviewing ${selected.length} file(s) in ${scopeLabel}`) + (files.length > selected.length ? chalk.yellow(` (${files.length - selected.length} skipped by --max-files)`) : ''));
-            for (const f of selected) say(chalk.gray(`  ${f}`));
-
             const provider = await AIProviderFactory.createProvider();
             const model = provider.getModel();
-            say(chalk.gray(`\n  Model: ${config.activeProvider} / ${model}\n`));
+            const skipped = files.length - selected.length;
+            const mark = !machine && process.stdout.isTTY && keeperShown() ? `${paintKeeper('idle')}  ` : '';
+            say('');
+            say(`${mark}${chalk.bold('Reviewing')} ${selected.length} file${selected.length === 1 ? '' : 's'} ${chalk.gray('in')} ${scopeLabel} ${chalk.gray('with')} ${chalk.cyan(`${config.activeProvider}/${model}`)}` + (skipped ? chalk.yellow(`  (${skipped} skipped by --max-files)`) : ''));
+            const shown = selected.slice(0, 8);
+            say(chalk.gray(`  ${shown.join('  ')}${selected.length > shown.length ? `  +${selected.length - shown.length} more` : ''}`));
+            say('');
 
             const status = new KeeperStatus(machine ? process.stderr : process.stdout);
             status.start(options.quick ? 'Reviewing the changes' : 'Investigating the repository before reporting');
@@ -80,7 +88,7 @@ export const reviewCommand = new Command('review')
             const maxSteps = Math.max(0, parseInt(options.maxSteps, 10) || 0);
             let analyzed: Awaited<ReturnType<typeof analyzeChanges>>;
             try {
-                analyzed = await analyzeChanges(root, scope, target, provider, { quick: options.quick, maxSteps, onStep });
+                analyzed = await analyzeChanges(root, scope, target, provider, { quick: options.quick, maxSteps, onStep, repoConfig, doubleCheck: options.quick ? false : options.doubleCheck, onRejected: (f, why) => status.step(`dropped after a second look: ${f.content.slice(0, 70)}${why ? ` (${why})` : ''}`) });
             } finally {
                 status.stop();
             }
@@ -95,12 +103,21 @@ export const reviewCommand = new Command('review')
                 }))
             );
 
-            if (format === 'text' && !machine && process.stdout.isTTY && keeperShown()) {
-                const high = findings.filter((f) => meetsSeverity(f.severity, 'high')).length;
+            const readLines = (file: string) => {
+                try {
+                    return readForReview(root, scope, file).split('\n');
+                } catch {
+                    return undefined;
+                }
+            };
+            if (format === 'text' && !options.output) {
+                process.stdout.write(renderFindings(findings, { readLines, columns: process.stdout.columns }));
+                const secs = (status.elapsedMs / 1000).toFixed(1);
+                const meta = chalk.gray(`${secs}s${options.quick ? '' : ` · ${status.lookups} lookup${status.lookups === 1 ? '' : 's'}`} · ${config.activeProvider}/${model}`);
                 const pose = findings.length
-                    ? keeperPose('found', chalk.bold(`Found ${findings.length} issue${findings.length === 1 ? '' : 's'}`), high ? [chalk.red(`${high} high or critical`)] : [])
-                    : keeperPose('clean', chalk.bold.green('All clear'), [chalk.gray(`No issues in ${scopeLabel}`)]);
-                console.log('\n' + pose.join('\n'));
+                    ? keeperPose('found', `${chalk.bold(`${findings.length} finding${findings.length === 1 ? '' : 's'}`)}  ${severityCounts(findings)}`, [meta, ...(findings.some((f) => f.diff?.trim()) ? [chalk.gray('Apply a fix with ownkey apply <id>, or all of them with ownkey apply --all')] : [])])
+                    : keeperPose('clean', `${chalk.bold.green('All clear')}  ${chalk.gray(`no issues in ${scopeLabel}`)}`, [meta]);
+                console.log('\n' + pose.join('\n') + '\n');
             }
 
             reportKeeperMood(findings.length ? 'found' : 'clean');
@@ -148,6 +165,7 @@ async function emit(findings: Finding[], format: Format, output: string | undefi
         default:
             body = renderText(findings);
     }
+    if (format === 'text' && !output) return;
     if (output) {
         await writeFile(output, body, 'utf-8');
         console.log(chalk.green(`  Wrote ${format} report to ${output}`));
